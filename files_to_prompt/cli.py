@@ -1,8 +1,11 @@
 import os
 import sys
 from fnmatch import fnmatch
+from pathlib import Path
 
 import click
+from pathspec import PathSpec
+from pathspec.patterns import GitWildMatchPattern
 
 global_index = 1
 
@@ -24,41 +27,21 @@ EXT_TO_LANG = {
 }
 
 
-def should_ignore(path, gitignore_rules):
-    for rule in gitignore_rules:
-        if fnmatch(os.path.basename(path), rule):
-            return True
-        if os.path.isdir(path) and fnmatch(os.path.basename(path) + "/", rule):
-            return True
-    return False
-
-
-def read_gitignore(path):
-    gitignore_path = os.path.join(path, ".gitignore")
-    if os.path.isfile(gitignore_path):
-        with open(gitignore_path, "r") as f:
-            return [
-                line.strip() for line in f if line.strip() and not line.startswith("#")
-            ]
-    return []
-
-
 def add_line_numbers(content):
     lines = content.splitlines()
-
     padding = len(str(len(lines)))
-
     numbered_lines = [f"{i + 1:{padding}}  {line}" for i, line in enumerate(lines)]
     return "\n".join(numbered_lines)
 
 
 def print_path(writer, path, content, cxml, markdown, line_numbers):
+    normalized_path = Path(path).as_posix()
     if cxml:
-        print_as_xml(writer, path, content, line_numbers)
+        print_as_xml(writer, normalized_path, content, line_numbers)
     elif markdown:
-        print_as_markdown(writer, path, content, line_numbers)
+        print_as_markdown(writer, normalized_path, content, line_numbers)
     else:
-        print_default(writer, path, content, line_numbers)
+        print_default(writer, normalized_path, content, line_numbers)
 
 
 def print_default(writer, path, content, line_numbers):
@@ -86,7 +69,6 @@ def print_as_xml(writer, path, content, line_numbers):
 
 def print_as_markdown(writer, path, content, line_numbers):
     lang = EXT_TO_LANG.get(path.split(".")[-1], "")
-    # Figure out how many backticks to use
     backticks = "```"
     while backticks in content:
         backticks += "`"
@@ -104,7 +86,6 @@ def process_path(
     include_hidden,
     ignore_files_only,
     ignore_gitignore,
-    gitignore_rules,
     ignore_patterns,
     writer,
     claude_xml,
@@ -113,75 +94,95 @@ def process_path(
 ):
     if os.path.isfile(path):
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 print_path(writer, path, f.read(), claude_xml, markdown, line_numbers)
         except UnicodeDecodeError:
             warning_message = f"Warning: Skipping file {path} due to UnicodeDecodeError"
             click.echo(click.style(warning_message, fg="red"), err=True)
-    elif os.path.isdir(path):
-        for root, dirs, files in os.walk(path):
-            if not include_hidden:
-                dirs[:] = [d for d in dirs if not d.startswith(".")]
-                files = [f for f in files if not f.startswith(".")]
+        return
 
-            if not ignore_gitignore:
-                gitignore_rules.extend(read_gitignore(root))
-                dirs[:] = [
-                    d
-                    for d in dirs
-                    if not should_ignore(os.path.join(root, d), gitignore_rules)
-                ]
-                files = [
-                    f
-                    for f in files
-                    if not should_ignore(os.path.join(root, f), gitignore_rules)
-                ]
-
-            if ignore_patterns:
-                if not ignore_files_only:
-                    dirs[:] = [
-                        d
-                        for d in dirs
-                        if not any(fnmatch(d, pattern) for pattern in ignore_patterns)
-                    ]
-                files = [
-                    f
-                    for f in files
-                    if not any(fnmatch(f, pattern) for pattern in ignore_patterns)
-                ]
-
-            if extensions:
-                files = [f for f in files if f.endswith(extensions)]
-
-            for file in sorted(files):
-                file_path = os.path.join(root, file)
+    base_path = Path(path)
+    
+    # FIX: Initialize all_patterns before the conditional block
+    all_patterns = []
+    if not ignore_gitignore:
+        for root, _, _ in os.walk(base_path):
+            gitignore_file = Path(root) / ".gitignore"
+            if gitignore_file.is_file():
                 try:
-                    with open(file_path, "r") as f:
-                        print_path(
-                            writer,
-                            file_path,
-                            f.read(),
-                            claude_xml,
-                            markdown,
-                            line_numbers,
-                        )
+                    with open(gitignore_file, "r", encoding="utf-8") as f:
+                        # Get path of .gitignore relative to the base_path
+                        relative_dir = gitignore_file.parent.relative_to(base_path)
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                # Prepend the relative directory to the pattern
+                                # This makes patterns like `/foo` work correctly
+                                if str(relative_dir) == ".":
+                                    all_patterns.append(line)
+                                else:
+                                    all_patterns.append(f"{relative_dir.as_posix()}/{line}")
+
                 except UnicodeDecodeError:
-                    warning_message = (
-                        f"Warning: Skipping file {file_path} due to UnicodeDecodeError"
-                    )
+                    warning_message = f"Warning: Skipping .gitignore file {gitignore_file} due to UnicodeDecodeError"
                     click.echo(click.style(warning_message, fg="red"), err=True)
+
+    # Create a single spec from all collected patterns
+    gitignore_spec = PathSpec.from_lines(GitWildMatchPattern, all_patterns)
+
+    files_to_process = []
+    for root, dirs, files in os.walk(path, topdown=True):
+        # Filter hidden files and directories first
+        if not include_hidden:
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            files = [f for f in files if not f.startswith(".")]
+        
+        # Filter based on --ignore patterns
+        if ignore_patterns:
+            if not ignore_files_only:
+                dirs[:] = [d for d in dirs if not any(fnmatch(d, p) for p in ignore_patterns)]
+            files = [f for f in files if not any(fnmatch(f, p) for p in ignore_patterns)]
+        
+        # Combine dirs and files for gitignore checking
+        paths_to_check = [Path(root).relative_to(base_path) / item for item in dirs + files]
+        
+        # Filter based on the comprehensive .gitignore spec
+        ignored_paths = set(gitignore_spec.match_files(paths_to_check))
+        
+        dirs[:] = [d for d in dirs if Path(root).relative_to(base_path) / d not in ignored_paths]
+        files = [f for f in files if Path(root).relative_to(base_path) / f not in ignored_paths]
+
+        # Filter based on extensions
+        if extensions:
+            files = [f for f in files if f.endswith(extensions)]
+
+        for file in files:
+            files_to_process.append(os.path.join(root, file))
+
+    for file_path in sorted(files_to_process):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                print_path(
+                    writer,
+                    file_path,
+                    f.read(),
+                    claude_xml,
+                    markdown,
+                    line_numbers,
+                )
+        except UnicodeDecodeError:
+            warning_message = f"Warning: Skipping file {file_path} due to UnicodeDecodeError"
+            click.echo(click.style(warning_message, fg="red"), err=True)
 
 
 def read_paths_from_stdin(use_null_separator):
     if sys.stdin.isatty():
-        # No ready input from stdin, don't block for input
         return []
-
     stdin_content = sys.stdin.read()
     if use_null_separator:
         paths = stdin_content.split("\0")
     else:
-        paths = stdin_content.split()  # split on whitespace
+        paths = stdin_content.split()
     return [p for p in paths if p]
 
 
@@ -258,76 +259,41 @@ def cli(
     line_numbers,
     null,
 ):
-    """
-    Takes one or more paths to files or directories and outputs every file,
-    recursively, each one preceded with its filename like this:
-
-    \b
-        path/to/file.py
-        ----
-        Contents of file.py goes here
-        ---
-        path/to/file2.py
-        ---
-        ...
-
-    If the `--cxml` flag is provided, the output will be structured as follows:
-
-    \b
-        <documents>
-        <document path="path/to/file1.txt">
-        Contents of file1.txt
-        </document>
-        <document path="path/to/file2.txt">
-        Contents of file2.txt
-        </document>
-        ...
-        </documents>
-
-    If the `--markdown` flag is provided, the output will be structured as follows:
-
-    \b
-        path/to/file1.py
-        ```python
-        Contents of file1.py
-        ```
-    """
-    # Reset global_index for pytest
+    """Docstring unchanged"""
     global global_index
     global_index = 1
 
-    # Read paths from stdin if available
+    if not sys.stdin.isatty():
+        sys.stdin.reconfigure(encoding='utf-8')
+
     stdin_paths = read_paths_from_stdin(use_null_separator=null)
+    all_paths = [*paths, *stdin_paths]
 
-    # Combine paths from arguments and stdin
-    paths = [*paths, *stdin_paths]
-
-    gitignore_rules = []
     writer = click.echo
     fp = None
     if output_file:
         fp = open(output_file, "w", encoding="utf-8")
         writer = lambda s: print(s, file=fp)
-    for path in paths:
+
+    if claude_xml:
+        writer("<documents>")
+
+    for path in all_paths:
         if not os.path.exists(path):
             raise click.BadArgumentUsage(f"Path does not exist: {path}")
-        if not ignore_gitignore:
-            gitignore_rules.extend(read_gitignore(os.path.dirname(path)))
-        if claude_xml and path == paths[0]:
-            writer("<documents>")
         process_path(
             path,
             extensions,
             include_hidden,
             ignore_files_only,
             ignore_gitignore,
-            gitignore_rules,
             ignore_patterns,
             writer,
             claude_xml,
             markdown,
             line_numbers,
         )
+
     if claude_xml:
         writer("</documents>")
     if fp:

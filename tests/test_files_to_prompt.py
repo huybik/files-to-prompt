@@ -1,6 +1,9 @@
+# tests/test_files_to_prompt.py
+
 import os
 import pytest
 import re
+from pathlib import Path
 
 from click.testing import CliRunner
 
@@ -9,31 +12,91 @@ from files_to_prompt.cli import cli
 
 def filenames_from_cxml(cxml_string):
     "Return set of filenames from <source>...</source> tags"
-    return set(re.findall(r"<source>(.*?)</source>", cxml_string))
+    # Normalize paths to use forward slashes for comparison
+    paths = re.findall(r"<source>(.*?)</source>", cxml_string)
+    return set(p.replace("\\", "/") for p in paths)
 
 
 def test_basic_functionality(tmpdir):
     runner = CliRunner()
     with tmpdir.as_cwd():
-        os.makedirs("test_dir")
-        with open("test_dir/file1.txt", "w") as f:
+        os.makedirs("test_dir/subdir")
+        file1_path = os.path.join("test_dir", "file1.txt")
+        file2_path = os.path.join("test_dir", "subdir", "file2.txt")
+
+        with open(file1_path, "w", encoding="utf-8") as f:
             f.write("Contents of file1")
-        with open("test_dir/file2.txt", "w") as f:
+        with open(file2_path, "w", encoding="utf-8") as f:
             f.write("Contents of file2")
 
         result = runner.invoke(cli, ["test_dir"])
         assert result.exit_code == 0
-        assert "test_dir/file1.txt" in result.output
-        assert "Contents of file1" in result.output
-        assert "test_dir/file2.txt" in result.output
-        assert "Contents of file2" in result.output
+
+        output = result.output.replace("\\", "/")
+        assert Path(file1_path).as_posix() in output
+        assert "Contents of file1" in output
+        assert Path(file2_path).as_posix() in output
+        assert "Contents of file2" in output
+
+
+def test_gitignore_wildcard_handling(tmpdir):
+    """
+    Tests that a .gitignore with '*' correctly ignores everything except
+    files that are explicitly re-included with '!'.
+    """
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        os.makedirs("project/src")
+        with open("project/.gitignore", "w", encoding="utf-8") as f:
+            f.write("*\n!important.txt\n!/src/")
+        with open("project/src/.gitignore", "w", encoding="utf-8") as f:
+            f.write("*.log")
+
+        with open("project/ignored.tmp", "w", encoding="utf-8") as f:
+            f.write("ignored")
+        with open("project/important.txt", "w", encoding="utf-8") as f:
+            f.write("important")
+        with open("project/src/code.py", "w", encoding="utf-8") as f:
+            f.write("code")
+        with open("project/src/debug.log", "w", encoding="utf-8") as f:
+            f.write("log")
+
+        result = runner.invoke(cli, ["project", "-c"])
+        assert result.exit_code == 0, result.output
+
+        filenames = filenames_from_cxml(result.output)
+
+        assert filenames == {
+            "project/important.txt",
+            "project/src/code.py",
+        }
+
+# NEW TEST: Specifically validates the fix for the UnicodeDecodeError on Windows
+def test_unicode_characters_in_file(tmpdir):
+    """
+    Tests that a file containing unicode characters (like emojis) is read
+    correctly without a UnicodeDecodeError.
+    """
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        os.makedirs("test_dir")
+        unicode_content = "Hello, world! -- 💡🐞Feedback --"
+        with open("test_dir/unicode_file.txt", "w", encoding="utf-8") as f:
+            f.write(unicode_content)
+
+        # This would fail on Windows without the encoding="utf-8" fix
+        result = runner.invoke(cli, ["test_dir"])
+        
+        assert result.exit_code == 0
+        assert "Skipping file" not in result.stderr
+        assert unicode_content in result.output
 
 
 def test_include_hidden(tmpdir):
     runner = CliRunner()
     with tmpdir.as_cwd():
         os.makedirs("test_dir")
-        with open("test_dir/.hidden.txt", "w") as f:
+        with open("test_dir/.hidden.txt", "w", encoding="utf-8") as f:
             f.write("Contents of hidden file")
 
         result = runner.invoke(cli, ["test_dir"])
@@ -42,7 +105,7 @@ def test_include_hidden(tmpdir):
 
         result = runner.invoke(cli, ["test_dir", "--include-hidden"])
         assert result.exit_code == 0
-        assert "test_dir/.hidden.txt" in result.output
+        assert Path("test_dir/.hidden.txt").as_posix() in result.output
         assert "Contents of hidden file" in result.output
 
 
@@ -52,20 +115,17 @@ def test_ignore_gitignore(tmpdir):
         os.makedirs("test_dir")
         os.makedirs("test_dir/nested_include")
         os.makedirs("test_dir/nested_ignore")
-        with open("test_dir/.gitignore", "w") as f:
-            f.write("ignored.txt")
-        with open("test_dir/ignored.txt", "w") as f:
+        with open("test_dir/.gitignore", "w", encoding="utf-8") as f:
+            f.write("ignored.txt\n")
+            f.write("nested_ignore/\n") # Test ignoring a whole directory
+        with open("test_dir/ignored.txt", "w", encoding="utf-8") as f:
             f.write("This file should be ignored")
-        with open("test_dir/included.txt", "w") as f:
+        with open("test_dir/included.txt", "w", encoding="utf-8") as f:
             f.write("This file should be included")
-        with open("test_dir/nested_include/included2.txt", "w") as f:
+        with open("test_dir/nested_include/included2.txt", "w", encoding="utf-8") as f:
             f.write("This nested file should be included")
-        with open("test_dir/nested_ignore/.gitignore", "w") as f:
-            f.write("nested_ignore.txt")
-        with open("test_dir/nested_ignore/nested_ignore.txt", "w") as f:
+        with open("test_dir/nested_ignore/should_be_ignored.txt", "w", encoding="utf-8") as f:
             f.write("This nested file should not be included")
-        with open("test_dir/nested_ignore/actually_include.txt", "w") as f:
-            f.write("This nested file should actually be included")
 
         result = runner.invoke(cli, ["test_dir", "-c"])
         assert result.exit_code == 0
@@ -74,7 +134,6 @@ def test_ignore_gitignore(tmpdir):
         assert filenames == {
             "test_dir/included.txt",
             "test_dir/nested_include/included2.txt",
-            "test_dir/nested_ignore/actually_include.txt",
         }
 
         result2 = runner.invoke(cli, ["test_dir", "-c", "--ignore-gitignore"])
@@ -85,8 +144,7 @@ def test_ignore_gitignore(tmpdir):
             "test_dir/included.txt",
             "test_dir/ignored.txt",
             "test_dir/nested_include/included2.txt",
-            "test_dir/nested_ignore/nested_ignore.txt",
-            "test_dir/nested_ignore/actually_include.txt",
+            "test_dir/nested_ignore/should_be_ignored.txt",
         }
 
 
@@ -94,23 +152,22 @@ def test_multiple_paths(tmpdir):
     runner = CliRunner()
     with tmpdir.as_cwd():
         os.makedirs("test_dir1")
-        with open("test_dir1/file1.txt", "w") as f:
+        with open("test_dir1/file1.txt", "w", encoding="utf-8") as f:
             f.write("Contents of file1")
         os.makedirs("test_dir2")
-        with open("test_dir2/file2.txt", "w") as f:
+        with open("test_dir2/file2.txt", "w", encoding="utf-8") as f:
             f.write("Contents of file2")
-        with open("single_file.txt", "w") as f:
+        with open("single_file.txt", "w", encoding="utf-8") as f:
             f.write("Contents of single file")
 
         result = runner.invoke(cli, ["test_dir1", "test_dir2", "single_file.txt"])
         assert result.exit_code == 0
-        assert "test_dir1/file1.txt" in result.output
+        assert Path("test_dir1/file1.txt").as_posix() in result.output
         assert "Contents of file1" in result.output
-        assert "test_dir2/file2.txt" in result.output
+        assert Path("test_dir2/file2.txt").as_posix() in result.output
         assert "Contents of file2" in result.output
-        assert "single_file.txt" in result.output
+        assert Path("single_file.txt").as_posix() in result.output
         assert "Contents of single file" in result.output
-
 
 def test_ignore_patterns(tmpdir):
     runner = CliRunner()
@@ -235,12 +292,12 @@ def test_mixed_paths_with_options(tmpdir):
 
 
 def test_binary_file_warning(tmpdir):
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     with tmpdir.as_cwd():
         os.makedirs("test_dir")
         with open("test_dir/binary_file.bin", "wb") as f:
-            f.write(b"\xff")
-        with open("test_dir/text_file.txt", "w") as f:
+            f.write(b"\xff") # This is not valid UTF-8, so it should still fail
+        with open("test_dir/text_file.txt", "w", encoding="utf-8") as f:
             f.write("This is a text file")
 
         result = runner.invoke(cli, ["test_dir"])
@@ -249,11 +306,11 @@ def test_binary_file_warning(tmpdir):
         stdout = result.stdout
         stderr = result.stderr
 
-        assert "test_dir/text_file.txt" in stdout
+        assert Path("test_dir/text_file.txt").as_posix() in stdout
         assert "This is a text file" in stdout
-        assert "\ntest_dir/binary_file.bin" not in stdout
+        assert "binary_file.bin" not in stdout
         assert (
-            "Warning: Skipping file test_dir/binary_file.bin due to UnicodeDecodeError"
+            f"Warning: Skipping file {os.path.join('test_dir', 'binary_file.bin')} due to UnicodeDecodeError"
             in stderr
         )
 
